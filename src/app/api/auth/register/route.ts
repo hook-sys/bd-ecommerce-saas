@@ -14,6 +14,21 @@ import { getAppOrigin } from "@/lib/env";
 // and avoids ever creating a tenant for an account nobody has confirmed
 // owning yet.
 //
+// Supabase Auth enforces its own email-sending throttling — a per-address
+// resend cooldown ("For security purposes, you can only request this
+// after N seconds") and a separate, project-wide send quota
+// (`over_email_send_rate_limit`, 429) when using Supabase's default/shared
+// email service. Both come back from supabase-js as an AuthApiError with
+// status 429. Neither is something this route implements or can safely
+// remove (see AGENTS.md / DEVELOPMENT_RULES.md: never weaken auth
+// security) — it's surfaced as a proper 429 with a stable, non-leaky
+// message instead of forwarding Supabase's raw internal wording as a 400
+// VALIDATION_ERROR.
+function isSupabaseRateLimitError(error: { status?: number; code?: string } | null | undefined): boolean {
+  if (!error) return false;
+  return error.status === 429 || error.code === "over_email_send_rate_limit";
+}
+
 // The desired store name is carried in Supabase user_metadata
 // (`pending_store_name`) until the callback reads it back — the client
 // never gets to specify a tenantId, role, or plan; those stay entirely
@@ -36,6 +51,13 @@ export async function POST(request: Request) {
         data: { pending_store_name: input.storeName },
       },
     });
+
+    if (isSupabaseRateLimitError(error)) {
+      throw new AppError(
+        "RATE_LIMITED",
+        "Too many registration attempts right now. Please wait a minute and try again."
+      );
+    }
 
     if (error || !data.user) {
       throw new AppError("VALIDATION_ERROR", error?.message ?? "Could not create account.");

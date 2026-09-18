@@ -21,7 +21,8 @@ export type AppErrorCode =
   | "INVALID_CREDENTIALS"
   | "PRODUCT_NOT_FOUND"
   | "CATEGORY_NOT_FOUND"
-  | "SKU_ALREADY_EXISTS";
+  | "SKU_ALREADY_EXISTS"
+  | "RATE_LIMITED";
 
 const STATUS_BY_CODE: Record<AppErrorCode, number> = {
   TENANT_NOT_FOUND: 404,
@@ -44,6 +45,7 @@ const STATUS_BY_CODE: Record<AppErrorCode, number> = {
   PRODUCT_NOT_FOUND: 404,
   CATEGORY_NOT_FOUND: 404,
   SKU_ALREADY_EXISTS: 409,
+  RATE_LIMITED: 429,
 };
 
 export class AppError extends Error {
