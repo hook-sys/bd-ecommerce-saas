@@ -1,0 +1,724 @@
+// Phase 1 foundation schema.
+// Only the tables required to support auth, tenant provisioning, subdomain
+// resolution, plans/subscriptions, feature flags, domains, and audit logging
+// are defined here. Commerce tables (products, orders, etc.) are added in
+// later phases per the phased build plan.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum GlobalRole {
+  SUPER_ADMIN
+  USER
+}
+
+enum TenantRole {
+  TENANT_OWNER
+  TENANT_ADMIN
+  TENANT_STAFF
+}
+
+enum TenantStatus {
+  ACTIVE
+  TRIAL
+  PAST_DUE
+  GRACE_PERIOD
+  SUSPENDED
+  CANCELLED
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  GRACE_PERIOD
+  SUSPENDED
+  CANCELLED
+}
+
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum DomainType {
+  SUBDOMAIN
+  CUSTOM
+}
+
+enum DomainVerificationStatus {
+  PENDING
+  VERIFIED
+  FAILED
+}
+
+enum FeatureOverrideType {
+  ENABLE
+  DISABLE
+}
+
+enum ThemeStatus {
+  DRAFT
+  PUBLISHED
+  UNPUBLISHED
+  ARCHIVED
+}
+
+enum ThemeAccessType {
+  FREE
+  PREMIUM
+}
+
+// Controls which tenants can see/install a theme at all. This is the actual
+// eligibility gate; ThemeAccessType is informational (badge/label) only.
+enum ThemeVisibilityType {
+  ALL
+  SELECTED_PLANS
+  SELECTED_TENANTS
+}
+
+enum ThemeVersionStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum ThemeAssetType {
+  PACKAGE
+  PREVIEW
+  IMAGE
+  FONT
+  OTHER
+}
+
+enum TenantThemeStatus {
+  INSTALLED
+  ACTIVE
+}
+
+// Shared by Product and Category — both have the same lifecycle. Only
+// ACTIVE items are ever visible on the storefront; DRAFT and ARCHIVED are
+// merchant-dashboard-only states.
+enum CatalogStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+// Mirrors the Supabase auth.users row this app cares about. `id` is the
+// Supabase auth user id (uuid) — this table is never the source of truth for
+// credentials, only for app-level profile/role data.
+model User {
+  id          String     @id @default(uuid())
+  email       String     @unique
+  fullName    String?
+  globalRole  GlobalRole @default(USER)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  ownedTenants  Tenant[]     @relation("TenantOwner")
+  tenantLinks   TenantUser[]
+  auditLogs     AuditLog[]
+  impersonationsAsActor  ImpersonationSession[] @relation("ImpersonationActor")
+
+  @@index([email])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Tenant
+// ---------------------------------------------------------------------------
+
+model Tenant {
+  id             String       @id @default(uuid())
+  name           String
+  slug           String       @unique
+  status         TenantStatus @default(TRIAL)
+  ownerId        String
+  owner          User         @relation("TenantOwner", fields: [ownerId], references: [id])
+
+  planId         String?
+  plan           Plan?        @relation(fields: [planId], references: [id])
+
+  // The tenant's single active storefront theme. Nullable: a brand-new
+  // tenant has no theme installed/activated yet. This is the authoritative
+  // pointer — TenantTheme.status = ACTIVE is a convenience label kept in
+  // sync with it, not a second source of truth (enforced in
+  // TenantThemeService, since Postgres/Prisma can't express "at most one
+  // ACTIVE row per tenant" as a plain unique index).
+  activeTenantThemeId String?      @unique
+  activeTenantTheme   TenantTheme? @relation("ActiveTenantTheme", fields: [activeTenantThemeId], references: [id])
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  deletedAt      DateTime?
+
+  tenantUsers    TenantUser[]
+  domains        Domain[]
+  subscription   Subscription?
+  storeSettings  StoreSettings?
+  themeSettings  ThemeSettings?
+  tenantFeatures TenantFeature[]
+  auditLogs      AuditLog[]
+  notifications  Notification[]
+  impersonationSessions ImpersonationSession[]
+  tenantThemes           TenantTheme[]           @relation("TenantThemeInstalls")
+  themeTenantVisibilities ThemeTenantVisibility[]
+  tenantThemeSettings    TenantThemeSettings[]
+  products               Product[]
+  categories             Category[]
+
+  @@index([slug])
+  @@index([status])
+  @@index([ownerId])
+  @@map("tenants")
+}
+
+// Join table between a user and a tenant, carrying the tenant-scoped role.
+// A user can belong to multiple tenants (e.g. staff working two stores).
+model TenantUser {
+  id        String     @id @default(uuid())
+  tenantId  String
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      TenantRole
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([tenantId, userId])
+  @@index([userId])
+  @@index([tenantId])
+  @@map("tenant_users")
+}
+
+// ---------------------------------------------------------------------------
+// Domains (subdomain + custom domain, prepared from day one)
+// ---------------------------------------------------------------------------
+
+model Domain {
+  id                 String                   @id @default(uuid())
+  tenantId           String
+  tenant             Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  type               DomainType
+  hostname           String                   @unique // e.g. "rahim.myplatform.com" or "www.rahimfashion.com"
+  isPrimary          Boolean                  @default(false)
+  verificationStatus DomainVerificationStatus @default(PENDING)
+  verificationToken  String?
+  sslStatus          String? // provider-reported status, populated in the custom-domain phase
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+
+  @@index([tenantId])
+  @@index([hostname])
+  @@map("domains")
+}
+
+// ---------------------------------------------------------------------------
+// Plans, features, feature flags
+// ---------------------------------------------------------------------------
+
+model Plan {
+  id            String   @id @default(uuid())
+  key           String   @unique // e.g. "free", "basic", "pro", "business"
+  name          String
+  description   String?
+  defaultMonthlyFee Decimal @db.Decimal(10, 2)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenants       Tenant[]
+  planFeatures  PlanFeature[]
+  subscriptions Subscription[]
+  themePlanVisibilities ThemePlanVisibility[]
+
+  @@map("plans")
+}
+
+model Feature {
+  id          String   @id @default(uuid())
+  key         String   @unique // e.g. "courier", "bkash", "pos"
+  name        String
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  planFeatures   PlanFeature[]
+  tenantFeatures TenantFeature[]
+
+  @@map("features")
+}
+
+// Default feature availability for a plan.
+model PlanFeature {
+  id        String  @id @default(uuid())
+  planId    String
+  plan      Plan    @relation(fields: [planId], references: [id], onDelete: Cascade)
+  featureId String
+  feature   Feature @relation(fields: [featureId], references: [id], onDelete: Cascade)
+  enabled   Boolean @default(false)
+
+  @@unique([planId, featureId])
+  @@index([planId])
+  @@map("plan_features")
+}
+
+// Per-tenant override on top of the plan default. When absent, the plan
+// default applies. See FeatureService for the resolution order.
+model TenantFeature {
+  id           String              @id @default(uuid())
+  tenantId     String
+  tenant       Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  featureId    String
+  feature      Feature             @relation(fields: [featureId], references: [id], onDelete: Cascade)
+  enabled      Boolean
+  overrideType FeatureOverrideType
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  @@unique([tenantId, featureId])
+  @@index([tenantId])
+  @@map("tenant_features")
+}
+
+// ---------------------------------------------------------------------------
+// Subscription & billing
+// ---------------------------------------------------------------------------
+
+model Subscription {
+  id               String             @id @default(uuid())
+  tenantId         String             @unique
+  tenant           Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  planId           String
+  plan             Plan               @relation(fields: [planId], references: [id])
+  status           SubscriptionStatus @default(TRIAL)
+  monthlyFee       Decimal            @db.Decimal(10, 2) // per-tenant override of plan.defaultMonthlyFee
+  billingCycle     BillingCycle       @default(MONTHLY)
+  startDate        DateTime           @default(now())
+  trialEndDate     DateTime?
+  nextBillingDate  DateTime?
+  gracePeriodEndsAt DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  payments  Payment[]
+  invoices  Invoice[]
+
+  @@index([status])
+  @@index([tenantId])
+  @@map("subscriptions")
+}
+
+model Payment {
+  id             String        @id @default(uuid())
+  subscriptionId String
+  subscription   Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  amount         Decimal       @db.Decimal(10, 2)
+  currency       String        @default("BDT")
+  status         PaymentStatus @default(PENDING)
+  provider       String? // e.g. "bkash", "nagad", "manual"
+  providerRef    String?
+  paidAt         DateTime?
+  createdAt      DateTime      @default(now())
+
+  invoice Invoice?
+
+  @@index([subscriptionId])
+  @@index([status])
+  @@map("payments")
+}
+
+model Invoice {
+  id             String       @id @default(uuid())
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  paymentId      String?      @unique
+  payment        Payment?     @relation(fields: [paymentId], references: [id])
+  number         String       @unique
+  amount         Decimal      @db.Decimal(10, 2)
+  issuedAt       DateTime     @default(now())
+  dueAt          DateTime?
+
+  @@index([subscriptionId])
+  @@map("invoices")
+}
+
+// ---------------------------------------------------------------------------
+// Store configuration (minimal foundation; full theming arrives in Phase 8)
+// ---------------------------------------------------------------------------
+
+model StoreSettings {
+  id             String   @id @default(uuid())
+  tenantId       String   @unique
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  storeName      String
+  contactEmail   String?
+  contactPhone   String?
+  currency       String   @default("BDT")
+  // Phase 3 SEO foundation — per-tenant storefront metadata. All optional:
+  // the storefront falls back to storeName / a generic description /
+  // platform defaults when unset, never to an error.
+  metaTitle       String?
+  metaDescription String?
+  faviconUrl      String?
+  ogImageUrl      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("store_settings")
+}
+
+// Legacy minimal per-tenant appearance stub, created automatically at
+// provisioning time before a theme is chosen. Distinct from
+// TenantThemeSettings below, which holds per-installed-theme configuration
+// once the Theme Library is in use. Candidate for consolidation into
+// TenantThemeSettings once every tenant has an installed theme.
+model ThemeSettings {
+  id         String   @id @default(uuid())
+  tenantId   String   @unique
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  primaryColor String @default("#111827")
+  logoUrl    String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@map("theme_settings")
+}
+
+// ---------------------------------------------------------------------------
+// Theme Library (platform-level storefront themes)
+//
+// Theme / ThemeVersion / ThemeAsset are GLOBAL platform entities — only
+// SUPER_ADMIN can create/publish/unpublish/archive them (enforced in
+// ThemeAdminService, not just in the UI). TenantTheme and
+// TenantThemeSettings are the tenant-owned side: which theme/version a
+// tenant has installed, and that tenant's own customization on top of it.
+// Installing or customizing a theme never writes to Theme/ThemeVersion —
+// merchant data and theme code stay fully separate, matching the platform's
+// existing tenant-isolation rules.
+// ---------------------------------------------------------------------------
+
+model Theme {
+  id             String              @id @default(uuid())
+  name           String
+  slug           String              @unique
+  description    String?
+  category       String?
+  thumbnailUrl   String?
+  status         ThemeStatus         @default(DRAFT)
+  accessType     ThemeAccessType     @default(FREE)
+  visibilityType ThemeVisibilityType @default(ALL)
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  versions           ThemeVersion[]
+  tenantThemes       TenantTheme[]
+  planVisibilities   ThemePlanVisibility[]
+  tenantVisibilities ThemeTenantVisibility[]
+
+  @@index([status])
+  @@index([slug])
+  @@map("themes")
+}
+
+// Immutable once status becomes PUBLISHED: publishing a new version of a
+// theme creates a new ThemeVersion row rather than mutating an existing one,
+// so a tenant on an older version is never silently broken by a platform
+// update (see ThemeAdminService.publishThemeVersion).
+model ThemeVersion {
+  id              String             @id @default(uuid())
+  themeId         String
+  theme           Theme              @relation(fields: [themeId], references: [id], onDelete: Cascade)
+  version         String // semver, e.g. "1.0.0"
+  status          ThemeVersionStatus @default(DRAFT)
+  // The Theme Contract: metadata, supportedPages, components, sections,
+  // configurableSettings, designTokens. Validated against
+  // themeContractSchema (src/lib/validators/theme.ts) before save — this is
+  // what keeps an uploaded theme a data/config package rather than
+  // arbitrary executable code. See ARCHITECTURE.md "Theme Contract".
+  contract        Json
+  packagePath     String? // object storage path to the prepared theme package
+  previewImageUrl String?
+  changelog       String?
+  publishedAt     DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  assets       ThemeAsset[]
+  tenantThemes TenantTheme[]
+
+  @@unique([themeId, version])
+  @@index([themeId])
+  @@index([status])
+  @@map("theme_versions")
+}
+
+model ThemeAsset {
+  id             String         @id @default(uuid())
+  themeVersionId String
+  themeVersion   ThemeVersion   @relation(fields: [themeVersionId], references: [id], onDelete: Cascade)
+  type           ThemeAssetType
+  storagePath    String // e.g. platform-themes/fashion-pro/v1.0.0/assets/...
+  createdAt      DateTime       @default(now())
+
+  @@index([themeVersionId])
+  @@map("theme_assets")
+}
+
+// Which plans a SELECTED_PLANS-visibility theme is available to.
+model ThemePlanVisibility {
+  id      String @id @default(uuid())
+  themeId String
+  theme   Theme  @relation(fields: [themeId], references: [id], onDelete: Cascade)
+  planId  String
+  plan    Plan   @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([themeId, planId])
+  @@index([themeId])
+  @@map("theme_plan_visibilities")
+}
+
+// Which specific tenants a SELECTED_TENANTS-visibility theme is available
+// to (e.g. a bespoke "VIP Fashion" theme).
+model ThemeTenantVisibility {
+  id       String @id @default(uuid())
+  themeId  String
+  theme    Theme  @relation(fields: [themeId], references: [id], onDelete: Cascade)
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([themeId, tenantId])
+  @@index([themeId])
+  @@index([tenantId])
+  @@map("theme_tenant_visibilities")
+}
+
+// A tenant's installation of a theme. Installing does not activate it —
+// activation is the separate Tenant.activeTenantThemeId pointer. Updating
+// to a new published version reassigns themeVersionId on this same row
+// (preserving TenantThemeSettings, which hangs off TenantTheme.id, not off
+// themeVersionId) rather than creating a new install record.
+model TenantTheme {
+  id             String            @id @default(uuid())
+  tenantId       String
+  tenant         Tenant            @relation("TenantThemeInstalls", fields: [tenantId], references: [id], onDelete: Cascade)
+  themeId        String
+  theme          Theme             @relation(fields: [themeId], references: [id])
+  themeVersionId String
+  themeVersion   ThemeVersion      @relation(fields: [themeVersionId], references: [id])
+  status         TenantThemeStatus @default(INSTALLED)
+  installedAt    DateTime          @default(now())
+  activatedAt    DateTime?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  activeForTenant Tenant?              @relation("ActiveTenantTheme")
+  settings        TenantThemeSettings?
+
+  @@unique([tenantId, themeId])
+  @@index([tenantId])
+  @@index([themeId])
+  @@map("tenant_themes")
+}
+
+// Merchant customization on top of an installed theme (logo, brand colors,
+// typography, header/footer, homepage sections, banners, social links,
+// contact info, product display settings). Never modifies the global
+// Theme/ThemeVersion it's layered on.
+model TenantThemeSettings {
+  id            String      @id @default(uuid())
+  tenantId      String
+  tenant        Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenantThemeId String      @unique
+  tenantTheme   TenantTheme @relation(fields: [tenantThemeId], references: [id], onDelete: Cascade)
+  settings      Json        @default("{}")
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([tenantId])
+  @@map("tenant_theme_settings")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog (Phase 4): Product, Category, and their many-to-many association.
+//
+// Every row here is tenant-owned — Product/Category both carry tenantId and
+// every uniqueness rule (slug, sku) is scoped to (tenantId, ...), never
+// global. ProductCategory additionally carries its own tenantId and uses it
+// in *both* of its foreign keys (see below) so Postgres itself — not just
+// application code — refuses to link a product and a category that belong
+// to different tenants.
+// ---------------------------------------------------------------------------
+
+model Product {
+  id               String        @id @default(uuid())
+  tenantId         String
+  tenant           Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name             String
+  slug             String
+  description      String?
+  shortDescription String?
+  sku              String? // optional for MVP — see ARCHITECTURE.md "SKU"; unique per tenant when set
+  price            Decimal       @db.Decimal(10, 2)
+  compareAtPrice   Decimal?      @db.Decimal(10, 2)
+  status           CatalogStatus @default(DRAFT)
+  featured         Boolean       @default(false)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  images         ProductImage[]
+  categoryLinks  ProductCategory[]
+
+  // (tenantId, id) is the composite target ProductCategory's compound
+  // foreign key references — this is what makes the cross-tenant
+  // association check a database constraint, not just an application check.
+  @@unique([tenantId, id])
+  @@unique([tenantId, slug])
+  @@unique([tenantId, sku])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([createdAt])
+  @@map("products")
+}
+
+model ProductImage {
+  id        String   @id @default(uuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  url       String
+  altText   String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([productId])
+  @@map("product_images")
+}
+
+model Category {
+  id          String        @id @default(uuid())
+  tenantId    String
+  tenant      Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name        String
+  slug        String
+  description String?
+  image       String?
+  status      CatalogStatus @default(DRAFT)
+  sortOrder   Int           @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  productLinks ProductCategory[]
+
+  @@unique([tenantId, id])
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@index([sortOrder])
+  @@map("categories")
+}
+
+// The many-to-many join. tenantId is denormalized here specifically so it
+// can appear in both compound foreign keys below — that's what makes
+// "this product and this category belong to the same tenant" a constraint
+// the database enforces on every insert, not something application code
+// has to remember to check.
+model ProductCategory {
+  tenantId   String
+  productId  String
+  categoryId String
+
+  product  Product  @relation(fields: [tenantId, productId], references: [tenantId, id], onDelete: Cascade)
+  category Category @relation(fields: [tenantId, categoryId], references: [tenantId, id], onDelete: Cascade)
+
+  @@id([productId, categoryId])
+  @@index([productId])
+  @@index([categoryId])
+  @@index([tenantId])
+  @@map("product_categories")
+}
+
+// ---------------------------------------------------------------------------
+// Impersonation
+// ---------------------------------------------------------------------------
+
+model ImpersonationSession {
+  id           String    @id @default(uuid())
+  actorId      String
+  actor        User      @relation("ImpersonationActor", fields: [actorId], references: [id])
+  tenantId     String
+  tenant       Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  startedAt    DateTime  @default(now())
+  endedAt      DateTime?
+  reason       String?
+
+  @@index([actorId])
+  @@index([tenantId])
+  @@map("impersonation_sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  actorId      String?
+  actor        User?    @relation(fields: [actorId], references: [id])
+  actorRole    String?
+  tenantId     String?
+  tenant       Tenant?  @relation(fields: [tenantId], references: [id])
+  action       String // e.g. "tenant.suspend", "feature.toggle"
+  resourceType String
+  resourceId   String?
+  metadata     Json?
+  ipAddress    String?
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([actorId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications (foundation; delivery channels added later)
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String   @id @default(uuid())
+  tenantId  String?
+  tenant    Tenant?  @relation(fields: [tenantId], references: [id])
+  type      String
+  title     String
+  body      String?
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@map("notifications")
+}
