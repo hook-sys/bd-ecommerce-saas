@@ -8,25 +8,40 @@ import { prisma } from "@/lib/server/db/client";
 // Resolved per-request from the Host header — never statically prerendered.
 export const dynamic = "force-dynamic";
 
+// Next.js does not reliably route an exception thrown during metadata
+// resolution through the segment's own error.tsx (unlike an exception
+// thrown while rendering the component body, which does reach it) — a
+// failure here bypassed StorefrontError entirely and fell through to
+// Next's raw framework crash screen in production. Metadata is
+// inherently non-critical (falls back to the parent layout's title/
+// description when empty), so any failure here is swallowed to a safe
+// `{}` and the real, user-visible error handling is left to the page
+// body's own resolveTenantContext() call below, which does reach
+// StorefrontError normally.
 export async function generateMetadata(): Promise<Metadata> {
-  const ctx = await resolveTenantContext();
-  if (!ctx) return {};
+  try {
+    const ctx = await resolveTenantContext();
+    if (!ctx) return {};
 
-  const storeSettings = await prisma.storeSettings.findUnique({ where: { tenantId: ctx.id } });
+    const storeSettings = await prisma.storeSettings.findUnique({ where: { tenantId: ctx.id } });
 
-  const title = storeSettings?.metaTitle || ctx.name;
-  const description = storeSettings?.metaDescription || `Shop at ${ctx.name}.`;
+    const title = storeSettings?.metaTitle || ctx.name;
+    const description = storeSettings?.metaDescription || `Shop at ${ctx.name}.`;
 
-  return {
-    title,
-    description,
-    icons: storeSettings?.faviconUrl ? [{ url: storeSettings.faviconUrl }] : undefined,
-    openGraph: {
+    return {
       title,
       description,
-      images: storeSettings?.ogImageUrl ? [{ url: storeSettings.ogImageUrl }] : undefined,
-    },
-  };
+      icons: storeSettings?.faviconUrl ? [{ url: storeSettings.faviconUrl }] : undefined,
+      openGraph: {
+        title,
+        description,
+        images: storeSettings?.ogImageUrl ? [{ url: storeSettings.ogImageUrl }] : undefined,
+      },
+    };
+  } catch (error) {
+    console.error("storefront generateMetadata failed:", error instanceof Error ? error.message : "unknown error");
+    return {};
+  }
 }
 
 // Every route under this segment resolves the tenant exactly once, from the

@@ -24,7 +24,7 @@ vi.mock("@/lib/server/db/client", () => ({
   prisma: { storeSettings: { findUnique: vi.fn().mockResolvedValue(null) } },
 }));
 
-import TenantLayout from "@/app/storefront/[tenant]/layout";
+import TenantLayout, { generateMetadata } from "@/app/storefront/[tenant]/layout";
 
 // This is the app-level behavior behind "test.aladeen.app / unknown.aladeen.app"
 // from the production incident: the tenant slug itself is resolved by
@@ -103,5 +103,33 @@ describe("storefront [tenant] layout — tenant routing behavior", () => {
 
     await expect(TenantLayout({ children: null })).rejects.toThrow(/Authentication failed/);
     expect(notFound).not.toHaveBeenCalled();
+  });
+});
+
+// Production incident: this exact exception, thrown from
+// resolveTenantContext() during metadata resolution, bypassed the segment's
+// error.tsx entirely and rendered Next's raw framework crash screen instead
+// (a documented Next.js quirk: generateMetadata failures aren't routed
+// through the same error boundary a component-body throw is). generateMetadata
+// must swallow any failure to a safe `{}` — the actual user-visible error
+// handling is the component body's own resolveTenantContext() call, tested
+// above, which does reach the error boundary normally.
+describe("storefront [tenant] layout — generateMetadata resilience", () => {
+  beforeEach(() => {
+    resolveTenantContext.mockReset();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it("never throws — falls back to empty metadata when tenant resolution fails", async () => {
+    resolveTenantContext.mockRejectedValue(
+      new Error("Authentication failed against database server, the provided database credentials for `postgres` are not valid.")
+    );
+
+    await expect(generateMetadata()).resolves.toEqual({});
+  });
+
+  it("returns empty metadata when no tenant resolves (unchanged behavior)", async () => {
+    resolveTenantContext.mockResolvedValue(null);
+    await expect(generateMetadata()).resolves.toEqual({});
   });
 });
