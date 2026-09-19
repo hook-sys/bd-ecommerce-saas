@@ -52,4 +52,37 @@ describe("proxy (subdomain -> tenant rewrite)", () => {
     // For the root domain the header must not be forwarded at all.
     expect(res.headers.get("x-middleware-request-x-tenant-slug")).toBeNull();
   });
+
+  // Production incident coverage (aladeen.app): the fixture domain here is
+  // "myplatform.com" (this suite's PLATFORM_ROOT_DOMAIN, see vitest.config.ts)
+  // rather than the literal "aladeen.app" string, but parseHost/proxy logic
+  // is entirely env-driven — these cases are the exact shape of
+  // test.aladeen.app / unknown.aladeen.app / aladeen.app / www.aladeen.app.
+  it("resolves a known-shaped tenant subdomain (e.g. test.<root>) to the storefront segment", async () => {
+    const res = proxy(makeRequest("http://test.myplatform.com/", "test.myplatform.com"));
+    expect(res.headers.get("x-middleware-rewrite")).toContain("/storefront/test");
+  });
+
+  it("still rewrites an unknown-looking tenant subdomain into the storefront segment — 'does this tenant exist' is a DB question for the page/layout to answer with a controlled 404, not something middleware decides", async () => {
+    const res = proxy(makeRequest("http://unknown.myplatform.com/", "unknown.myplatform.com"));
+    expect(res.headers.get("x-middleware-rewrite")).toContain("/storefront/unknown");
+  });
+
+  it("serves the bare apex root domain as the platform site, unrewritten", async () => {
+    const res = proxy(makeRequest("http://myplatform.com/", "myplatform.com"));
+    expect(res.headers.get("x-middleware-rewrite")).toBeNull();
+  });
+
+  it("does not crash on a malformed/unusual Host header", async () => {
+    const malformedHosts = ["", "not a valid host!!", "::::", "myplatform.com:abc:def", "..myplatform.com"];
+    for (const host of malformedHosts) {
+      expect(() => proxy(makeRequest("http://myplatform.com/", host))).not.toThrow();
+    }
+  });
+
+  it("falls back to the configured root domain when the Host header is missing entirely", async () => {
+    const req = new NextRequest("http://myplatform.com/");
+    req.headers.delete("host");
+    expect(() => proxy(req)).not.toThrow();
+  });
 });
